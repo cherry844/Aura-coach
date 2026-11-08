@@ -1,0 +1,8 @@
+{
+  "name": "Aura: Global Skill & Life Coach",
+  "description": "An AI-powered life coach and peer-to-peer skill exchange platform with real-time user profiles, progress tracking, and gamified micro-learning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

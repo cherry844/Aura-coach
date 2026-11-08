@@ -1,0 +1,113 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and stats",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "points": { "type": "number" },
+        "skills_offered": { "type": "string" },
+        "skills_needed": { "type": "string" },
+        "exchange_methods": { "type": "string" },
+        "avatar_url": { "type": "string" },
+        "completed_lessons_count": { "type": "number" },
+        "completed_matches_count": { "type": "number" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "email"]
+    },
+    "Lesson": {
+      "title": "Lesson",
+      "description": "Educational micro-lesson",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "author_id": { "type": "string" },
+        "skill_tag": { "type": "string" },
+        "duration_mins": { "type": "number" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "content", "author_id"]
+    },
+    "Match": {
+      "title": "Match",
+      "description": "A skill exchange match between two users",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "user_a": { "type": "string" },
+        "user_b": { "type": "string" },
+        "skill": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "completed"] },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["user_a", "user_b", "skill"]
+    },
+    "Feedback": {
+      "title": "Feedback",
+      "description": "Feedback after a match",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "match_id": { "type": "string" },
+        "from_user_id": { "type": "string" },
+        "to_user_id": { "type": "string" },
+        "rating": { "type": "number" },
+        "comment": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["match_id", "from_user_id", "to_user_id", "rating"]
+    },
+    "Achievement": {
+      "title": "Achievement",
+      "description": "Unlocked badges",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "string" },
+        "achievement_id": { "type": "string" },
+        "unlocked_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "LessonCompletion": {
+      "title": "LessonCompletion",
+      "description": "Records when a user completes a lesson",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "string" },
+        "lesson_id": { "type": "string" },
+        "completed_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/lessons/{lessonId}": {
+      "schema": "Lesson",
+      "description": "Public micro-lessons"
+    },
+    "/matches/{matchId}": {
+      "schema": "Match",
+      "description": "Skill exchange matches"
+    },
+    "/feedback/{feedbackId}": {
+      "schema": "Feedback",
+      "description": "User feedback"
+    },
+    "/users/{userId}/achievements/{achievementId}": {
+      "schema": "Achievement",
+      "description": "User achievements"
+    },
+    "/users/{userId}/lesson_completions/{lessonId}": {
+      "schema": "LessonCompletion",
+      "description": "User lesson completions"
+    }
+  }
+}
