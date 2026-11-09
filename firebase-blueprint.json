@@ -7,6 +7,8 @@
       "properties": {
         "id": { "type": "string" },
         "name": { "type": "string" },
+        "username": { "type": "string" },
+        "bio": { "type": "string" },
         "email": { "type": "string" },
         "points": { "type": "number" },
         "skills_offered": { "type": "string" },
@@ -28,8 +30,11 @@
         "title": { "type": "string" },
         "content": { "type": "string" },
         "author_id": { "type": "string" },
+        "author_name": { "type": "string" },
         "skill_tag": { "type": "string" },
         "duration_mins": { "type": "number" },
+        "cover_image_url": { "type": "string" },
+        "cover_image_source": { "type": "string" },
         "created_at": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "title", "content", "author_id"]

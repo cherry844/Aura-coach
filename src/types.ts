@@ -3,7 +3,14 @@ export interface Achievement {
   name: string;
   description: string;
   icon: string;
-  unlocked_at: string;
+  unlocked_at?: string;
+  xp_reward: number;
+  category: 'learning' | 'mentorship' | 'community' | 'mastery';
+  isUnlocked: boolean;
+  progress?: {
+    current: number;
+    total: number;
+  };
 }
 
 export interface Feedback {
@@ -21,6 +28,8 @@ export interface Feedback {
 export interface User {
   id: string;
   name: string;
+  username?: string;
+  bio?: string;
   email: string;
   points: number;
   skills_offered: string; // Comma separated
@@ -31,6 +40,8 @@ export interface User {
   feedback?: Feedback[];
   completed_lessons_count: number;
   completed_matches_count: number;
+  created_at?: string;
+  updated_at?: any;
 }
 
 export interface Lesson {
@@ -38,9 +49,20 @@ export interface Lesson {
   title: string;
   content: string;
   author_id: string;
+  author_name?: string;
   skill_tag: string;
   duration_mins: number;
   created_at: string;
+  cover_image_url?: string;
+  cover_image_source?: 'ai' | 'upload' | 'fallback';
+}
+
+export interface LessonCompletion {
+  user_id: string;
+  lesson_id: string;
+  completed_at: string;
+  lesson_title?: string;
+  skill_tag?: string;
 }
 
 export interface ChatMessage {

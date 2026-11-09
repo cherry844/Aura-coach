@@ -8,13 +8,12 @@ import {
   deleteDoc, 
   query, 
   where, 
-  orderBy, 
   serverTimestamp,
   increment,
   addDoc
 } from "firebase/firestore";
-import { db, auth } from "./lib/firebase";
-import { User, Lesson, Feedback } from "./types";
+import { db, auth, storage, ref, uploadBytesResumable, uploadString, getDownloadURL } from "./lib/firebase";
+import { User, Lesson, Feedback, LessonCompletion } from "./types";
 
 enum OperationType {
   CREATE = 'create',
@@ -116,8 +115,10 @@ export const api = {
         id,
         created_at: lesson.created_at || new Date().toISOString()
       }, { merge: true });
+      return id;
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
+      return null;
     }
   },
 
@@ -133,7 +134,6 @@ export const api = {
   async getMatches(userId: string): Promise<User[]> {
     const path = "users";
     try {
-      // Simplification: just get other users for now, filtering logic can be app-side or more complex query
       const users = await this.getUsers();
       return users.filter(u => u.id !== userId);
     } catch (error) {
@@ -151,7 +151,6 @@ export const api = {
       const [snapA, snapB] = await Promise.all([getDocs(qA), getDocs(qB)]);
       const matches = [...snapA.docs, ...snapB.docs].map(doc => ({ id: doc.id, ...doc.data() }));
       
-      // Filter out completed matches in-memory
       return matches.filter((m: any) => m.status !== "completed");
     } catch (error) {
       handleFirestoreError(error, OperationType.LIST, path);
@@ -176,7 +175,7 @@ export const api = {
     }
   },
 
-  async completeLesson(userId: string, lessonId: string) {
+  async completeLesson(userId: string, lessonId: string, lessonTitle?: string, skillTag?: string) {
     const path = `users/${userId}/lesson_completions/${lessonId}`;
     try {
       const completionRef = doc(db, "users", userId, "lesson_completions", lessonId);
@@ -186,6 +185,8 @@ export const api = {
       await setDoc(completionRef, {
         user_id: userId,
         lesson_id: lessonId,
+        lesson_title: lessonTitle || '',
+        skill_tag: skillTag || '',
         completed_at: new Date().toISOString()
       });
 
@@ -194,9 +195,38 @@ export const api = {
         completed_lessons_count: increment(1)
       });
 
-      return { success: true };
+      return { success: true, pointsAwarded: 10 };
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
+      return { success: false };
+    }
+  },
+
+  async getCompletedLessonIds(userId: string): Promise<string[]> {
+    const path = `users/${userId}/lesson_completions`;
+    try {
+      const snap = await getDocs(collection(db, "users", userId, "lesson_completions"));
+      return snap.docs.map(doc => doc.id);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+      return [];
+    }
+  },
+
+  async getCompletedLessons(userId: string): Promise<LessonCompletion[]> {
+    const path = `users/${userId}/lesson_completions`;
+    try {
+      const snap = await getDocs(collection(db, "users", userId, "lesson_completions"));
+      return snap.docs.map(d => ({
+        lesson_id: d.id,
+        user_id: userId,
+        completed_at: d.data().completed_at || '',
+        lesson_title: d.data().lesson_title || '',
+        skill_tag: d.data().skill_tag || ''
+      }));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+      return [];
     }
   },
 
@@ -241,5 +271,133 @@ export const api = {
       handleFirestoreError(error, OperationType.LIST, path);
       return [];
     }
+  },
+
+  /**
+   * Upload profile avatar image to Firebase Storage with validation and progress callback
+   */
+  async uploadProfileAvatar(userId: string, file: File, onProgress?: (pct: number) => void): Promise<string> {
+    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!validTypes.includes(file.type)) {
+      throw new Error('Please select a valid image file (JPEG, PNG, WebP, or GIF).');
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      throw new Error('Image size must be less than 5MB.');
+    }
+
+    const fileExt = file.name.split('.').pop() || 'jpg';
+    const storagePath = `profile_avatars/${userId}/${Date.now()}_avatar.${fileExt}`;
+    const fileRef = ref(storage, storagePath);
+    const uploadTask = uploadBytesResumable(fileRef, file);
+
+    return new Promise((resolve, reject) => {
+      uploadTask.on(
+        'state_changed',
+        (snapshot) => {
+          if (snapshot.totalBytes > 0) {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            if (onProgress) onProgress(Math.round(progress));
+          }
+        },
+        (error) => {
+          console.error('Firebase Storage avatar upload error:', error);
+          reject(error);
+        },
+        async () => {
+          try {
+            const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
+            resolve(downloadUrl);
+          } catch (err) {
+            reject(err);
+          }
+        }
+      );
+    });
+  },
+
+  /**
+   * Upload custom lesson cover image to Firebase Storage with validation and progress callback
+   */
+  async uploadLessonCover(lessonId: string, file: File, onProgress?: (pct: number) => void): Promise<string> {
+    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+    if (!validTypes.includes(file.type)) {
+      throw new Error('Please select a valid image file (JPEG, PNG, WebP, or SVG).');
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      throw new Error('Cover image size must be less than 8MB.');
+    }
+
+    const fileExt = file.name.split('.').pop() || 'png';
+    const storagePath = `lesson_covers/${lessonId}/${Date.now()}_cover.${fileExt}`;
+    const fileRef = ref(storage, storagePath);
+    const uploadTask = uploadBytesResumable(fileRef, file);
+
+    return new Promise((resolve, reject) => {
+      uploadTask.on(
+        'state_changed',
+        (snapshot) => {
+          if (snapshot.totalBytes > 0) {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            if (onProgress) onProgress(Math.round(progress));
+          }
+        },
+        (error) => {
+          console.error('Firebase Storage lesson cover upload error:', error);
+          reject(error);
+        },
+        async () => {
+          try {
+            const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
+            resolve(downloadUrl);
+          } catch (err) {
+            reject(err);
+          }
+        }
+      );
+    });
+  },
+
+  /**
+   * Generate an educational cover illustration via server API and save to Firebase Storage
+   */
+  async generateAndSaveLessonCover(
+    title: string, 
+    category: string, 
+    description?: string, 
+    lessonId?: string
+  ): Promise<{ coverUrl: string; source: 'ai' | 'fallback' }> {
+    const res = await fetch('/api/lessons/generate-cover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, category, description })
+    });
+
+    if (!res.ok) {
+      throw new Error(`Cover generation failed: ${res.statusText}`);
+    }
+
+    const data = await res.json();
+    const rawImageUrl: string = data.imageUrl;
+    const source: 'ai' | 'fallback' = data.source || 'fallback';
+
+    // If it's a data URL, upload to Firebase Storage to have a persistent cloud URL
+    if (rawImageUrl && rawImageUrl.startsWith('data:')) {
+      try {
+        const targetId = lessonId || `lesson_${Date.now()}`;
+        const isPng = rawImageUrl.startsWith('data:image/png');
+        const ext = isPng ? 'png' : 'svg';
+        const storagePath = `lesson_covers/${targetId}/cover_${Date.now()}.${ext}`;
+        const storageRef = ref(storage, storagePath);
+        
+        await uploadString(storageRef, rawImageUrl, 'data_url');
+        const downloadUrl = await getDownloadURL(storageRef);
+        return { coverUrl: downloadUrl, source };
+      } catch (storageErr) {
+        console.warn('Firebase Storage upload failed, falling back to data URL:', storageErr);
+        return { coverUrl: rawImageUrl, source };
+      }
+    }
+
+    return { coverUrl: rawImageUrl, source };
   }
 };
