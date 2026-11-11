@@ -1,11 +1,288 @@
 rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: /test/{docId}
+// Document ID: connection test probe (e.g. 'connection')
+// Fields:
+//   - status: string (optional)
+// Description: Used exclusively during app startup to detect offline mode / network connectivity.
+//
+// Collection: /users/{userId}
+// Document ID: Firebase Auth UID
+// Fields:
+//   - id: string (required, immutable) - Must match request.auth.uid
+//   - name: string (required, 1..100 chars) - User display name
+//   - username: string (optional, 0..60 chars) - Unique handle
+//   - bio: string (optional, 0..1000 chars) - Short biography
+//   - email: string (required/optional, 0..150 chars) - User email
+//   - points: number (optional, >= 0) - Accumulated XP
+//   - skills_offered: string (optional, 0..1000 chars) - Comma-separated list of skills
+//   - skills_needed: string (optional, 0..1000 chars) - Comma-separated list of learning goals
+//   - exchange_methods: string (optional, 0..500 chars) - Communication preferences
+//   - avatar_url: string (optional, 0..2000 chars) - Profile picture URL
+//   - completed_lessons_count: number (optional, >= 0) - Completed micro-lessons counter
+//   - completed_matches_count: number (optional, >= 0) - Completed peer matches counter
+//   - created_at: string/timestamp (optional) - Account creation timestamp
+//   - updated_at: timestamp/string (optional) - Last update timestamp
+//   - achievements: list (optional) - Embedded achievements cache
+//   - feedback: list (optional) - Embedded feedback cache
+//
+// Subcollection: /users/{userId}/lesson_completions/{lessonId}
+// Document ID: Target lesson ID
+// Fields:
+//   - user_id: string (required) - Must match parent userId and request.auth.uid
+//   - lesson_id: string (required) - Must match document ID
+//   - lesson_title: string (optional, <= 200 chars)
+//   - skill_tag: string (optional, <= 100 chars)
+//   - completed_at: string/timestamp (optional)
+//
+// Subcollection: /users/{userId}/achievements/{achievementId}
+// Document ID: Achievement identifier
+// Fields:
+//   - user_id: string (required) - Must match parent userId and request.auth.uid
+//   - achievement_id: string (required)
+//   - unlocked_at: string/timestamp (optional)
+//
+// Collection: /lessons/{lessonId}
+// Document ID: Unique lesson ID
+// Fields:
+//   - id: string (required, 1..100 chars)
+//   - title: string (required, 1..200 chars)
+//   - content: string (required, 1..50000 chars)
+//   - author_id: string (required, immutable) - Must match request.auth.uid
+//   - author_name: string (optional, <= 100 chars)
+//   - skill_tag: string (required, 1..100 chars)
+//   - duration_mins: number (required, 1..240)
+//   - cover_image_url: string (optional, <= 2000 chars)
+//   - cover_image_source: string (optional, enum: 'ai' | 'upload' | 'fallback')
+//   - created_at: string/timestamp (optional)
+//
+// Collection: /matches/{matchId}
+// Document ID: Auto-generated match ID
+// Fields:
+//   - user_a: string (required, 1..100 chars, immutable) - Initiator user UID
+//   - user_b: string (required, 1..100 chars, immutable) - Matched peer user UID
+//   - skill: string (required, 1..200 chars) - Skill topic
+//   - status: string (required, enum: 'pending' | 'completed')
+//   - created_at: string/timestamp (optional)
+//
+// Collection: /feedback/{feedbackId}
+// Document ID: Auto-generated feedback ID
+// Fields:
+//   - id: string (optional, 1..100 chars)
+//   - match_id: string (required, 1..100 chars)
+//   - from_user_id: string (required, immutable) - Reviewer UID == request.auth.uid
+//   - from_user_name: string (optional, <= 100 chars)
+//   - from_user_avatar: string (optional, <= 2000 chars)
+//   - to_user_id: string (required, 1..100 chars) - Recipient peer UID
+//   - rating: number (required, 1..5)
+//   - comment: string (required, <= 2000 chars)
+//   - created_at: string/timestamp (optional)
+//
+// ===============================================================
+
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUser(data, userId) {
+      return data.keys().hasOnly([
+        'id', 'name', 'username', 'bio', 'email', 'points',
+        'skills_offered', 'skills_needed', 'exchange_methods',
+        'avatar_url', 'completed_lessons_count', 'completed_matches_count',
+        'created_at', 'updated_at', 'achievements', 'feedback'
+      ]) &&
+      data.id is string && data.id == userId &&
+      data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+      (!('username' in data) || (data.username is string && data.username.size() <= 60)) &&
+      (!('bio' in data) || (data.bio is string && data.bio.size() <= 1000)) &&
+      (!('email' in data) || (data.email is string && data.email.size() <= 150)) &&
+      (!('points' in data) || (data.points is number && data.points >= 0)) &&
+      (!('skills_offered' in data) || (data.skills_offered is string && data.skills_offered.size() <= 1000)) &&
+      (!('skills_needed' in data) || (data.skills_needed is string && data.skills_needed.size() <= 1000)) &&
+      (!('exchange_methods' in data) || (data.exchange_methods is string && data.exchange_methods.size() <= 500)) &&
+      (!('avatar_url' in data) || (data.avatar_url is string && data.avatar_url.size() <= 2000)) &&
+      (!('completed_lessons_count' in data) || (data.completed_lessons_count is number && data.completed_lessons_count >= 0)) &&
+      (!('completed_matches_count' in data) || (data.completed_matches_count is number && data.completed_matches_count >= 0));
+    }
+
+    function isValidLesson(data) {
+      return data.keys().hasOnly([
+        'id', 'title', 'content', 'author_id', 'author_name',
+        'skill_tag', 'duration_mins', 'created_at', 'cover_image_url', 'cover_image_source'
+      ]) &&
+      data.id is string && data.id.size() > 0 && data.id.size() <= 100 &&
+      data.title is string && data.title.size() > 0 && data.title.size() <= 200 &&
+      data.content is string && data.content.size() > 0 && data.content.size() <= 50000 &&
+      data.author_id is string && data.author_id == request.auth.uid &&
+      (!('author_name' in data) || (data.author_name is string && data.author_name.size() <= 100)) &&
+      data.skill_tag is string && data.skill_tag.size() > 0 && data.skill_tag.size() <= 100 &&
+      data.duration_mins is number && data.duration_mins >= 1 && data.duration_mins <= 240 &&
+      (!('cover_image_url' in data) || (data.cover_image_url is string && data.cover_image_url.size() <= 2000)) &&
+      (!('cover_image_source' in data) || (data.cover_image_source in ['ai', 'upload', 'fallback']));
+    }
+
+    function isValidMatch(data) {
+      return data.keys().hasOnly([
+        'user_a', 'user_b', 'skill', 'status', 'created_at'
+      ]) &&
+      data.user_a is string && data.user_a.size() > 0 && data.user_a.size() <= 100 &&
+      data.user_b is string && data.user_b.size() > 0 && data.user_b.size() <= 100 &&
+      data.skill is string && data.skill.size() > 0 && data.skill.size() <= 200 &&
+      data.status in ['pending', 'completed'];
+    }
+
+    function isValidFeedback(data) {
+      return data.keys().hasOnly([
+        'id', 'match_id', 'from_user_id', 'from_user_name',
+        'from_user_avatar', 'to_user_id', 'rating', 'comment', 'created_at'
+      ]) &&
+      data.match_id is string && data.match_id.size() > 0 && data.match_id.size() <= 100 &&
+      data.from_user_id is string && data.from_user_id == request.auth.uid &&
+      (!('from_user_name' in data) || (data.from_user_name is string && data.from_user_name.size() <= 100)) &&
+      (!('from_user_avatar' in data) || (data.from_user_avatar is string && data.from_user_avatar.size() <= 2000)) &&
+      data.to_user_id is string && data.to_user_id.size() > 0 && data.to_user_id.size() <= 100 &&
+      data.rating is number && data.rating >= 1 && data.rating <= 5 &&
+      data.comment is string && data.comment.size() <= 2000;
+    }
+
+    function isValidLessonCompletion(data, userId, lessonId) {
+      return data.keys().hasOnly([
+        'user_id', 'lesson_id', 'lesson_title', 'skill_tag', 'completed_at'
+      ]) &&
+      data.user_id is string && data.user_id == userId && data.user_id == request.auth.uid &&
+      data.lesson_id is string && data.lesson_id == lessonId &&
+      (!('lesson_title' in data) || (data.lesson_title is string && data.lesson_title.size() <= 200)) &&
+      (!('skill_tag' in data) || (data.skill_tag is string && data.skill_tag.size() <= 100));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    // Essential startup connection probe
     match /test/{docId} {
       allow read: if true;
+      allow write: if false;
     }
+
+    // User profiles & community discovery
+    match /users/{userId} {
+      // Authenticated users can read profiles for peer skill exchange and leaderboard
+      allow read: if isAuthenticated();
+      
+      // Users can only create their own user document
+      allow create: if isOwner(userId) && isValidUser(request.resource.data, userId);
+      
+      // Users can only update their own user document and cannot change their id
+      allow update: if isOwner(userId) && 
+                       request.resource.data.id == resource.data.id &&
+                       isValidUser(request.resource.data, userId);
+      
+      // Users can delete their own profile
+      allow delete: if isOwner(userId);
+
+      // Lesson completions subcollection
+      match /lesson_completions/{lessonId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidLessonCompletion(request.resource.data, userId, lessonId);
+        allow delete: if isOwner(userId);
+      }
+
+      // Achievements subcollection
+      match /achievements/{achievementId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) &&
+          request.resource.data.user_id == userId &&
+          request.resource.data.achievement_id == achievementId;
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // Micro-lessons
+    match /lessons/{lessonId} {
+      // Authenticated learners can browse micro-lessons
+      allow read: if isAuthenticated();
+      
+      // Author must be authenticated user
+      allow create: if isAuthenticated() &&
+                       request.resource.data.author_id == request.auth.uid &&
+                       isValidLesson(request.resource.data);
+      
+      // Only the author can update their lesson, and author_id is immutable
+      allow update: if isAuthenticated() &&
+                       resource.data.author_id == request.auth.uid &&
+                       request.resource.data.author_id == resource.data.author_id &&
+                       isValidLesson(request.resource.data);
+      
+      // Only author can delete their lesson
+      allow delete: if isAuthenticated() && resource.data.author_id == request.auth.uid;
+    }
+
+    // Skill exchange matches
+    match /matches/{matchId} {
+      // Only involved participants can read the match
+      allow read: if isAuthenticated() &&
+                     (resource.data.user_a == request.auth.uid || resource.data.user_b == request.auth.uid);
+      
+      // Initiator creates match and must be user_a
+      allow create: if isAuthenticated() &&
+                       request.resource.data.user_a == request.auth.uid &&
+                       isValidMatch(request.resource.data);
+      
+      // Either participant can update status (e.g. mark completed), users cannot be changed
+      allow update: if isAuthenticated() &&
+                       (resource.data.user_a == request.auth.uid || resource.data.user_b == request.auth.uid) &&
+                       request.resource.data.user_a == resource.data.user_a &&
+                       request.resource.data.user_b == resource.data.user_b &&
+                       isValidMatch(request.resource.data);
+      
+      // Either participant can cancel / delete the match
+      allow delete: if isAuthenticated() &&
+                       (resource.data.user_a == request.auth.uid || resource.data.user_b == request.auth.uid);
+    }
+
+    // Peer feedback
+    match /feedback/{feedbackId} {
+      // Sender and recipient can read the feedback
+      allow read: if isAuthenticated() &&
+                     (resource.data.to_user_id == request.auth.uid || resource.data.from_user_id == request.auth.uid);
+      
+      // Feedback author creates it
+      allow create: if isAuthenticated() &&
+                       request.resource.data.from_user_id == request.auth.uid &&
+                       isValidFeedback(request.resource.data);
+      
+      // Only author can update or delete
+      allow update: if isAuthenticated() &&
+                       resource.data.from_user_id == request.auth.uid &&
+                       request.resource.data.from_user_id == resource.data.from_user_id &&
+                       isValidFeedback(request.resource.data);
+      
+      allow delete: if isAuthenticated() && resource.data.from_user_id == request.auth.uid;
+    }
+
+    // Default deny for all other paths
     match /{document=**} {
-      allow read, write: if request.auth != null;
+      allow read, write: if false;
     }
   }
 }

@@ -15,6 +15,7 @@ const SYSTEM_INSTRUCTION = "You are Aura, a high-performance AI life coach and p
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
   httpOptions: {
+    apiVersion: "v1alpha",
     headers: {
       "User-Agent": "aistudio-build",
     },
@@ -52,17 +53,18 @@ async function callGeminiWithRetry<T>(fn: () => Promise<T>, maxRetries = 3, base
 
 async function startServer() {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // Health check endpoint
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok" });
   });
 
-  // Server-side Gemini chat endpoint with retry for 503 UNAVAILABLE
+  // Server-side Gemini chat endpoint with retry for 503 UNAVAILABLE and Google Search Grounding
   app.post(["/api/coach/chat", "/api/coach/chat/"], async (req, res) => {
     try {
-      const { history } = req.body;
+      const { history, useSearch } = req.body;
       if (!history || !Array.isArray(history)) {
         return res.status(400).json({ error: "Missing or invalid 'history' payload." });
       }
@@ -73,23 +75,46 @@ async function startServer() {
         });
       }
 
+      const config: any = {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
+      };
+
+      // Enable Google Search grounding if requested or relevant
+      if (useSearch) {
+        config.tools = [{ googleSearch: {} }];
+      }
+
       const response = await callGeminiWithRetry(
         () =>
           ai.models.generateContent({
             model: "gemini-3.8-flash",
             contents: history,
-            config: {
-              systemInstruction: SYSTEM_INSTRUCTION,
-              thinkingConfig: {
-                thinkingLevel: ThinkingLevel.LOW,
-              },
-            },
+            config,
           }),
         3,
         1000
       );
 
-      return res.json({ text: response.text ?? "" });
+      // Extract grounding metadata and sources if search was used
+      const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
+      const rawChunks = groundingMetadata?.groundingChunks;
+      const webSearchQueries = groundingMetadata?.webSearchQueries || [];
+      const groundingSources = rawChunks
+        ?.map((chunk: any) => chunk.web)
+        .filter((web: any) => web && web.uri)
+        .map((web: any) => ({
+          title: web.title || new URL(web.uri).hostname,
+          uri: web.uri,
+        })) || [];
+
+      return res.json({
+        text: response.text ?? "",
+        groundingSources,
+        searchQueries: webSearchQueries,
+      });
     } catch (error: any) {
       console.error("Gemini API server error:", error);
       const is503 =
@@ -105,10 +130,10 @@ async function startServer() {
     }
   });
 
-  // Server-side Gemini chat streaming endpoint (Server-Sent Events) with 503 retry
+  // Server-side Gemini chat streaming endpoint (Server-Sent Events) with 503 retry and Google Search Grounding
   app.post(["/api/coach/chat-stream", "/api/coach/chat-stream/"], async (req, res) => {
     try {
-      const { history } = req.body;
+      const { history, useSearch } = req.body;
       if (!history || !Array.isArray(history)) {
         return res.status(400).json({ error: "Missing or invalid 'history' payload." });
       }
@@ -123,25 +148,46 @@ async function startServer() {
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
 
+      const config: any = {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
+      };
+
+      if (useSearch) {
+        config.tools = [{ googleSearch: {} }];
+      }
+
       const responseStream = await callGeminiWithRetry(
         () =>
           ai.models.generateContentStream({
             model: "gemini-3.8-flash",
             contents: history,
-            config: {
-              systemInstruction: SYSTEM_INSTRUCTION,
-              thinkingConfig: {
-                thinkingLevel: ThinkingLevel.LOW,
-              },
-            },
+            config,
           }),
         3,
         1000
       );
 
       for await (const chunk of responseStream) {
-        if (chunk.text) {
-          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        const text = chunk.text;
+        const groundingMetadata = chunk.candidates?.[0]?.groundingMetadata;
+        const rawChunks = groundingMetadata?.groundingChunks;
+        const groundingSources = rawChunks
+          ?.map((c: any) => c.web)
+          .filter((web: any) => web && web.uri)
+          .map((web: any) => ({
+            title: web.title || new URL(web.uri).hostname,
+            uri: web.uri,
+          }));
+
+        const payload: any = {};
+        if (text) payload.text = text;
+        if (groundingSources && groundingSources.length > 0) payload.groundingSources = groundingSources;
+
+        if (Object.keys(payload).length > 0) {
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
         }
       }
 
@@ -155,6 +201,52 @@ async function startServer() {
         res.write(`data: ${JSON.stringify({ error: error?.message || "Stream error." })}\n\n`);
         res.end();
       }
+    }
+  });
+
+  // Audio transcription endpoint using model gemini-3.5-transcribe
+  app.post(["/api/transcribe", "/api/transcribe/"], async (req, res) => {
+    try {
+      const { audio, mimeType } = req.body;
+      if (!audio) {
+        return res.status(400).json({ error: "Missing 'audio' base64 payload." });
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({
+          error: "GEMINI_API_KEY is not configured on the server. Please check Settings > Secrets.",
+        });
+      }
+
+      const response = await callGeminiWithRetry(
+        () =>
+          ai.models.generateContent({
+            model: "gemini-3.5-transcribe",
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: (mimeType || "audio/webm").split(";")[0].trim(),
+                    data: audio,
+                  },
+                },
+                {
+                  text: "Transcribe this audio accurately. Output only the verbatim spoken transcription with natural punctuation. Do not add conversational remarks or explanations.",
+                },
+              ],
+            },
+          }),
+        3,
+        1000
+      );
+
+      const transcript = (response.text ?? "").trim();
+      return res.json({ transcript });
+    } catch (error: any) {
+      console.error("Gemini audio transcription error:", error);
+      return res.status(500).json({
+        error: error?.message || "Failed to transcribe audio.",
+      });
     }
   });
 
@@ -335,16 +427,31 @@ async function startServer() {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
           systemInstruction: SYSTEM_INSTRUCTION,
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
         },
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
-            for (const part of message.serverContent?.modelTurn?.parts ?? []) {
+            const content = message.serverContent;
+            if (content?.inputTranscription?.text) {
+              clientWs.send(JSON.stringify({ inputTranscript: content.inputTranscription.text }));
+            }
+            if (content?.outputTranscription?.text) {
+              clientWs.send(JSON.stringify({ outputTranscript: content.outputTranscription.text }));
+            }
+            for (const part of content?.modelTurn?.parts ?? []) {
               if (part.inlineData?.data) {
                 clientWs.send(JSON.stringify({ audio: part.inlineData.data }));
               }
+              if (part.text) {
+                clientWs.send(JSON.stringify({ text: part.text }));
+              }
             }
-            if (message.serverContent?.interrupted) {
+            if (content?.interrupted) {
               clientWs.send(JSON.stringify({ interrupted: true }));
+            }
+            if (content?.turnComplete) {
+              clientWs.send(JSON.stringify({ turnComplete: true }));
             }
           },
           onclose: () => {

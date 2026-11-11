@@ -68,4 +68,9 @@ export interface LessonCompletion {
 export interface ChatMessage {
   role: 'user' | 'model';
   text: string;
+  groundingSources?: {
+    title: string;
+    uri: string;
+  }[];
+  isVoice?: boolean;
 }

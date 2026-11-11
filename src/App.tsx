@@ -24,6 +24,7 @@ import {
   CreditCard,
   Trash2,
   AlertTriangle,
+  AlertCircle,
   Users,
   CheckCircle,
   CheckCircle2,
@@ -39,12 +40,22 @@ import {
   BookmarkCheck,
   FileText,
   Key,
-  X
+  X,
+  Mic,
+  MicOff,
+  Radio,
+  Volume2,
+  VolumeX,
+  ExternalLink,
+  Square,
+  PhoneCall,
+  PhoneOff,
+  SearchCheck
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { api } from './api';
 import { User, Lesson, ChatMessage, LessonCompletion } from './types';
-import { getCoachResponse } from './services/geminiService';
+import { getCoachResponse, transcribeAudio, LiveVoiceSession, GroundingSource } from './services/geminiService';
 import Markdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -55,6 +66,7 @@ import { PasswordSettings } from './components/PasswordSettings';
 import { LessonCoverUpload } from './components/LessonCoverUpload';
 import { AchievementList } from './components/AchievementList';
 import { computeUserAchievements } from './lib/achievements';
+import { SubscriptionModal } from './components/SubscriptionModal';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -240,6 +252,29 @@ export default function App() {
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [showClearChatConfirm, setShowClearChatConfirm] = useState(false);
+  
+  // Gemini 3.8 Flash Google Search Grounding state
+  const [useSearchGrounding, setUseSearchGrounding] = useState<boolean>(true);
+
+  // Gemini 3.5 Transcribe audio recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<any>(null);
+  const [micPermissionNotice, setMicPermissionNotice] = useState<string | null>(null);
+
+  // Gemini 3.8 Live API real-time voice session state
+  const [showLiveVoiceModal, setShowLiveVoiceModal] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'speaking' | 'listening'>('disconnected');
+  const [liveUserTranscript, setLiveUserTranscript] = useState('');
+  const [liveAuraTranscript, setLiveAuraTranscript] = useState('');
+  const [liveTranscriptLog, setLiveTranscriptLog] = useState<{ speaker: 'user' | 'aura'; text: string; time: string }[]>([]);
+  const [isLiveMuted, setIsLiveMuted] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const liveSessionRef = useRef<LiveVoiceSession | null>(null);
+  const liveTranscriptEndRef = useRef<HTMLDivElement | null>(null);
   const [notificationSettings, setNotificationSettings] = useState(() => {
     try {
       const saved = localStorage.getItem('aura_notification_settings');
@@ -280,6 +315,31 @@ export default function App() {
   const [profileErrors, setProfileErrors] = useState<Record<string, string>>({});
   const [feedbackTarget, setFeedbackTarget] = useState<{ matchId: string, toUserId: string, toUserName: string } | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Settings and preferences state
+  const [settingsSubTab, setSettingsSubTab] = useState<'all' | 'account' | 'notifications' | 'privacy' | 'billing'>('all');
+  const [preferredLanguage, setPreferredLanguage] = useState<string>(() => {
+    try {
+      return localStorage.getItem('aura_preferred_lang') || 'English (US)';
+    } catch {
+      return 'English (US)';
+    }
+  });
+  const [accountSaveStatus, setAccountSaveStatus] = useState<string | null>(null);
+  const [privacySettings, setPrivacySettings] = useState(() => {
+    try {
+      const saved = localStorage.getItem('aura_privacy_settings');
+      return saved ? JSON.parse(saved) : { publicProfile: true, showPoints: true, twoFactor: false };
+    } catch {
+      return { publicProfile: true, showPoints: true, twoFactor: false };
+    }
+  });
+  const [privacySaveMsg, setPrivacySaveMsg] = useState<string | null>(null);
+  const [showBillingModal, setShowBillingModal] = useState(false);
+
+  // Micro-lessons search and category filter state
+  const [lessonSearchQuery, setLessonSearchQuery] = useState('');
+  const [selectedLessonCategory, setSelectedLessonCategory] = useState<string>('All');
 
   // Auth and data initialization
   useEffect(() => {
@@ -519,8 +579,15 @@ export default function App() {
         role: m.role,
         parts: [{ text: m.text }]
       }));
-      const response = await getCoachResponse(history);
-      setChatHistory(prev => [...prev, { role: 'model', text: response || "I'm here to help." }]);
+      const response = await getCoachResponse(history, useSearchGrounding);
+      setChatHistory(prev => [
+        ...prev,
+        {
+          role: 'model',
+          text: response?.text || "I'm here to help.",
+          groundingSources: response?.groundingSources
+        }
+      ]);
     } catch (error: any) {
       console.error(error);
       setChatHistory(prev => [...prev, {
@@ -532,6 +599,193 @@ export default function App() {
     } finally {
       setIsTyping(false);
     }
+  };
+
+  // Audio transcription (gemini-3.5-transcribe) recording handlers
+  const startRecordingAudio = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType || 'audio/webm' });
+        // Release mic stream tracks
+        stream.getTracks().forEach((track) => track.stop());
+
+        if (audioBlob.size > 0) {
+          setIsTranscribing(true);
+          try {
+            const transcriptText = await transcribeAudio(audioBlob);
+            if (transcriptText.trim()) {
+              setInput((prev) => (prev ? `${prev} ${transcriptText.trim()}` : transcriptText.trim()));
+            }
+          } catch (transcribeErr: any) {
+            console.error("Audio transcription error:", transcribeErr);
+          } finally {
+            setIsTranscribing(false);
+          }
+        }
+      };
+
+      mediaRecorder.start(250);
+      setIsRecording(true);
+      setRecordingSeconds(0);
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingSeconds((s) => s + 1);
+      }, 1000);
+    } catch (err: any) {
+      console.error("Microphone access denied for transcription:", err);
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      setIsRecording(false);
+      setRecordingSeconds(0);
+      const isPermissionDenied =
+        err?.name === 'NotAllowedError' ||
+        err?.name === 'PermissionDeniedError' ||
+        (typeof err?.message === 'string' && (err.message.includes('Permission') || err.message.includes('denied')));
+      const msg = isPermissionDenied
+        ? "Microphone access was denied. Please allow microphone permissions in your browser address bar or site settings to transcribe audio."
+        : (err?.message || "Could not access microphone.");
+      setMicPermissionNotice(msg);
+      setTimeout(() => setMicPermissionNotice(null), 8000);
+    }
+  };
+
+  const stopRecordingAudio = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    setIsRecording(false);
+  };
+
+  const cancelRecordingAudio = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      audioChunksRef.current = [];
+      mediaRecorderRef.current.stop();
+    }
+    setIsRecording(false);
+    setRecordingSeconds(0);
+  };
+
+  // Real-time Live API voice conversation (gemini-3.8-live) handlers
+  const startLiveVoiceSession = async () => {
+    setShowLiveVoiceModal(true);
+    setLiveError(null);
+    setLiveUserTranscript('');
+    setLiveAuraTranscript('');
+    setLiveTranscriptLog([]);
+    setIsLiveMuted(false);
+
+    const session = new LiveVoiceSession();
+    liveSessionRef.current = session;
+
+    session.onStatusChange = (status) => {
+      setLiveStatus(status);
+    };
+
+    session.onError = (err) => {
+      setLiveError(err);
+    };
+
+    session.onTranscript = (data) => {
+      const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      if (data.user) {
+        setLiveUserTranscript(data.user);
+        setLiveTranscriptLog((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.speaker === 'user') {
+            return [...prev.slice(0, -1), { speaker: 'user', text: `${last.text} ${data.user}`, time: timeStr }];
+          }
+          return [...prev, { speaker: 'user', text: data.user!, time: timeStr }];
+        });
+      }
+      if (data.aura) {
+        setLiveAuraTranscript(data.aura);
+        setLiveTranscriptLog((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.speaker === 'aura') {
+            return [...prev.slice(0, -1), { speaker: 'aura', text: `${last.text} ${data.aura}`, time: timeStr }];
+          }
+          return [...prev, { speaker: 'aura', text: data.aura!, time: timeStr }];
+        });
+      }
+      setTimeout(() => {
+        liveTranscriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 50);
+    };
+
+    session.onInterrupted = () => {
+      // Handled inside session stopPlayback
+    };
+
+    try {
+      await session.start();
+    } catch (err: any) {
+      console.error("LiveVoiceSession start error:", err);
+      const isPermissionDenied =
+        err?.name === 'NotAllowedError' ||
+        err?.name === 'PermissionDeniedError' ||
+        (typeof err?.message === 'string' && (err.message.includes('Permission') || err.message.includes('denied')));
+      setLiveError(
+        isPermissionDenied
+          ? "Microphone access was denied. Please allow microphone permissions in your browser address bar to speak with Aura."
+          : (err?.message || "Could not access microphone or connect to Live API.")
+      );
+    }
+  };
+
+  const toggleLiveMute = () => {
+    if (liveSessionRef.current) {
+      const muted = liveSessionRef.current.toggleMute();
+      setIsLiveMuted(muted);
+    }
+  };
+
+  const interruptLivePlayback = () => {
+    if (liveSessionRef.current) {
+      liveSessionRef.current.stopPlayback();
+      setLiveStatus('listening');
+    }
+  };
+
+  const endLiveVoiceSession = (saveToChat: boolean = true) => {
+    if (liveSessionRef.current) {
+      liveSessionRef.current.stop();
+      liveSessionRef.current = null;
+    }
+    setLiveStatus('disconnected');
+
+    if (saveToChat && liveTranscriptLog.length > 0) {
+      const voiceMessages: ChatMessage[] = liveTranscriptLog.map((item) => ({
+        role: item.speaker === 'user' ? 'user' : 'model',
+        text: item.text,
+        isVoice: true,
+      }));
+      setChatHistory((prev) => [...prev, ...voiceMessages]);
+    }
+
+    setShowLiveVoiceModal(false);
   };
 
   const navigateToTab = (tab: 'coach' | 'exchange' | 'lessons' | 'leaderboard' | 'profile' | 'settings' | 'about') => {
@@ -619,15 +873,57 @@ export default function App() {
               className="h-[calc(100vh-140px)] md:h-[calc(100vh-180px)] flex flex-col gap-4"
             >
               <div className="flex-1 glass rounded-3xl overflow-hidden flex flex-col shadow-xl border-zinc-200">
-                <div className="p-3 md:p-4 border-b border-zinc-100 bg-zinc-50/50 flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-indigo-100 flex items-center justify-center text-indigo-600">
-                    <Brain size={18} />
+                <div className="p-3 md:p-4 border-b border-zinc-100 bg-zinc-50/50 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-lg bg-indigo-100 flex items-center justify-center text-indigo-600">
+                      <Brain size={18} />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h2 className="font-semibold text-sm">Aura AI Coach</h2>
+                        <span className="text-[10px] bg-indigo-100/70 text-indigo-700 px-1.5 py-0.5 rounded font-mono font-medium hidden sm:inline">
+                          gemini-3.8-flash
+                        </span>
+                      </div>
+                      <p className="text-xs text-zinc-500">Always active • Personalized for {user?.name}</p>
+                    </div>
                   </div>
-                  <div className="flex-1">
-                    <h2 className="font-semibold text-sm">Aura AI Coach</h2>
-                    <p className="text-xs text-zinc-500">Always active • Personalized for {user?.name}</p>
-                  </div>
+
                   <div className="flex items-center gap-2">
+                    {/* Google Search Grounding Toggle */}
+                    <button
+                      type="button"
+                      onClick={() => setUseSearchGrounding(!useSearchGrounding)}
+                      className={cn(
+                        "flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium transition-all border",
+                        useSearchGrounding
+                          ? "bg-emerald-50 text-emerald-800 border-emerald-200 shadow-xs"
+                          : "bg-white text-zinc-500 border-zinc-200 hover:bg-zinc-50"
+                      )}
+                      title="Toggle Google Search data grounding for up-to-date accurate insights"
+                    >
+                      <Globe size={13} className={useSearchGrounding ? "text-emerald-600" : "text-zinc-400"} />
+                      <span className="hidden sm:inline">Google Search</span>
+                      <span className={cn(
+                        "w-1.5 h-1.5 rounded-full transition-colors",
+                        useSearchGrounding ? "bg-emerald-500 animate-pulse" : "bg-zinc-300"
+                      )} />
+                    </button>
+
+                    {/* Gemini 3.8 Live API Voice Call Button */}
+                    <button
+                      type="button"
+                      onClick={startLiveVoiceSession}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-xl text-xs font-semibold shadow-sm hover:shadow-md transition-all active:scale-95"
+                      title="Open real-time voice conversation with gemini-3.8-live"
+                    >
+                      <Radio size={13} className="animate-pulse text-indigo-200" />
+                      <span>Live Voice</span>
+                      <span className="text-[10px] bg-white/20 px-1 py-0.2 rounded font-mono font-normal hidden sm:inline">3.8 Live</span>
+                    </button>
+
+                    <div className="w-px h-4 bg-zinc-200 mx-0.5 hidden sm:block" />
+
                     <button 
                       onClick={handleUndo}
                       disabled={undoStack.length === 0 || isTyping}
@@ -644,7 +940,7 @@ export default function App() {
                     >
                       <Redo size={16} />
                     </button>
-                    <div className="w-px h-4 bg-zinc-200 mx-1" />
+                    <div className="w-px h-4 bg-zinc-200 mx-0.5" />
                     <button 
                       onClick={() => setShowClearChatConfirm(true)}
                       disabled={chatHistory.length === 0 || isTyping}
@@ -656,7 +952,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6">
                   {chatHistory.length === 0 && (
                     <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-4 p-4">
                       <div className="w-12 h-12 md:w-16 md:h-16 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-600 mb-2">
@@ -664,10 +960,12 @@ export default function App() {
                         <MessageSquare size={24} className="md:hidden" />
                       </div>
                       <h3 className="text-lg md:text-xl font-display font-bold">What's on your mind today?</h3>
-                      <p className="text-zinc-500 text-xs md:text-sm">Whether it's a career hurdle, a personal goal, or a complex problem, I'm here to help you solve it.</p>
+                      <p className="text-zinc-500 text-xs md:text-sm">
+                        Ask questions with <span className="font-semibold text-emerald-600">Google Search data</span>, tap the microphone to <span className="font-semibold text-indigo-600">transcribe your voice</span> with gemini-3.5-transcribe, or start a <span className="font-semibold text-violet-600">Live Voice session</span> with gemini-3.8-live.
+                      </p>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full mt-4">
-                        <SuggestionCard text="How can I improve my focus?" onClick={() => setInput("How can I improve my focus?")} />
-                        <SuggestionCard text="Creative ways to learn design" onClick={() => setInput("What are some creative ways to learn design?")} />
+                        <SuggestionCard text="Latest trends in prompt engineering" onClick={() => setInput("What are the latest breakthrough trends in prompt engineering and generative AI?")} />
+                        <SuggestionCard text="How to structure high-impact micro-lessons" onClick={() => setInput("What are the best frameworks to structure high-impact 5-minute micro-lessons?")} />
                       </div>
                     </div>
                   )}
@@ -698,12 +996,43 @@ export default function App() {
                             ? "bg-indigo-600 text-white rounded-br-none shadow-md shadow-indigo-100" 
                             : "bg-white border border-zinc-100 text-zinc-800 rounded-bl-none shadow-sm hover:shadow-md hover:border-zinc-200"
                         )}>
+                          {msg.isVoice && (
+                            <div className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-violet-600 bg-violet-50 px-2 py-0.5 rounded-md border border-violet-100 mb-2">
+                              <Radio size={11} className="animate-pulse" />
+                              <span>Live Voice Note</span>
+                            </div>
+                          )}
                           <div className={cn("markdown-body", msg.role === 'user' && "user-markdown-body")}>
                             <Markdown>{msg.text}</Markdown>
                           </div>
+
+                          {/* Google Search Grounding Sources Display */}
+                          {msg.groundingSources && msg.groundingSources.length > 0 && (
+                            <div className="mt-3 pt-3 border-t border-zinc-100 flex flex-col gap-1.5 text-xs">
+                              <div className="flex items-center gap-1.5 text-emerald-700 font-semibold text-[11px]">
+                                <Globe size={12} className="text-emerald-600" />
+                                <span>Google Search Grounded Sources:</span>
+                              </div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {msg.groundingSources.map((source, sIdx) => (
+                                  <a
+                                    key={sIdx}
+                                    href={source.uri}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 bg-zinc-50 hover:bg-emerald-50 text-zinc-700 hover:text-emerald-700 border border-zinc-200 hover:border-emerald-200 rounded-lg text-[11px] transition-colors max-w-full"
+                                    title={source.title}
+                                  >
+                                    <span className="truncate max-w-[200px]">{source.title}</span>
+                                    <ExternalLink size={10} className="shrink-0 opacity-60" />
+                                  </a>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
                         <span className="text-[10px] text-zinc-400 px-1">
-                          {msg.role === 'user' ? 'Sent' : 'Aura AI'}
+                          {msg.role === 'user' ? 'Sent' : 'Aura AI (gemini-3.8-flash)'}
                         </span>
                       </div>
                     </div>
@@ -727,27 +1056,302 @@ export default function App() {
                   <div ref={chatEndRef} />
                 </div>
 
+                {/* Bottom Input Area with Audio Transcription (gemini-3.5-transcribe) */}
                 <div className="p-3 md:p-4 bg-white border-t border-zinc-100">
-                  <div className="relative flex items-center">
-                    <input 
-                      type="text" 
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                      placeholder="Ask Aura anything..."
-                      className="w-full bg-zinc-50 border border-zinc-200 rounded-2xl py-3 md:py-4 pl-4 md:pl-6 pr-12 md:pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all placeholder:text-zinc-400"
-                    />
-                    <button 
-                      onClick={handleSendMessage}
-                      disabled={!input.trim() || isTyping}
-                      className="absolute right-1.5 md:right-2 p-2.5 md:p-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:opacity-50 transition-colors shadow-md shadow-indigo-100 active:scale-95"
-                    >
-                      <Send size={18} className="hidden md:block" />
-                      <Send size={16} className="md:hidden" />
-                    </button>
-                  </div>
+                  {micPermissionNotice && (
+                    <div className="mb-2.5 p-3 bg-amber-50 border border-amber-200 text-amber-900 rounded-xl text-xs flex items-center justify-between gap-2 animate-in fade-in">
+                      <div className="flex items-center gap-2">
+                        <AlertCircle size={15} className="text-amber-600 shrink-0" />
+                        <span>{micPermissionNotice}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setMicPermissionNotice(null)}
+                        className="text-amber-600 hover:text-amber-800 p-0.5 rounded cursor-pointer"
+                        title="Dismiss"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  )}
+                  {isRecording ? (
+                    <div className="flex items-center justify-between gap-3 bg-red-50/90 border border-red-200 rounded-2xl py-3 px-4 animate-in fade-in">
+                      <div className="flex items-center gap-2.5 text-red-600 font-medium text-xs">
+                        <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping" />
+                        <span>Recording audio... ({recordingSeconds}s)</span>
+                      </div>
+                      <div className="flex-1 hidden sm:flex items-center justify-center gap-1">
+                        {[...Array(12)].map((_, i) => (
+                          <span
+                            key={i}
+                            className="w-1 bg-red-400 rounded-full animate-pulse"
+                            style={{
+                              height: `${10 + (i % 4) * 6}px`,
+                              animationDelay: `${i * 100}ms`
+                            }}
+                          />
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={cancelRecordingAudio}
+                          className="px-3 py-1.5 text-xs text-zinc-500 hover:text-zinc-800 rounded-xl transition-colors font-medium"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={stopRecordingAudio}
+                          className="flex items-center gap-1.5 px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-semibold shadow-sm transition-all"
+                        >
+                          <Square size={12} fill="white" />
+                          <span>Transcribe with 3.5</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="relative flex items-center">
+                      <input 
+                        type="text" 
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                        placeholder={
+                          isTranscribing 
+                            ? "Transcribing audio with gemini-3.5-transcribe..." 
+                            : useSearchGrounding 
+                              ? "Ask Aura anything (Google Search grounded)..." 
+                              : "Ask Aura anything..."
+                        }
+                        disabled={isTranscribing}
+                        className="w-full bg-zinc-50 border border-zinc-200 rounded-2xl py-3 md:py-4 pl-4 md:pl-6 pr-24 md:pr-28 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all placeholder:text-zinc-400 disabled:opacity-60"
+                      />
+                      <div className="absolute right-1.5 md:right-2 flex items-center gap-1">
+                        {/* Audio Transcription Mic Button (gemini-3.5-transcribe) */}
+                        <button
+                          type="button"
+                          onClick={startRecordingAudio}
+                          disabled={isTyping || isTranscribing}
+                          className={cn(
+                            "p-2.5 md:p-3 rounded-xl transition-all",
+                            isTranscribing
+                              ? "bg-amber-100 text-amber-700 animate-pulse"
+                              : "text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50"
+                          )}
+                          title="Click to speak and transcribe with gemini-3.5-transcribe"
+                        >
+                          <Mic size={18} className={isTranscribing ? "animate-spin" : ""} />
+                        </button>
+
+                        <button 
+                          type="button"
+                          onClick={handleSendMessage}
+                          disabled={!input.trim() || isTyping || isTranscribing}
+                          className="p-2.5 md:p-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:opacity-50 transition-colors shadow-md shadow-indigo-100 active:scale-95"
+                          title="Send message"
+                        >
+                          <Send size={18} className="hidden md:block" />
+                          <Send size={16} className="md:hidden" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
+
+              {/* Gemini 3.8 Live API Voice Call Modal */}
+              <AnimatePresence>
+                {showLiveVoiceModal && (
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="fixed inset-0 z-50 bg-black/60 backdrop-blur-md flex items-center justify-center p-4"
+                  >
+                    <motion.div
+                      initial={{ scale: 0.95, opacity: 0, y: 10 }}
+                      animate={{ scale: 1, opacity: 1, y: 0 }}
+                      exit={{ scale: 0.95, opacity: 0, y: 10 }}
+                      className="bg-white rounded-3xl max-w-lg w-full overflow-hidden shadow-2xl border border-zinc-100 flex flex-col max-h-[90vh]"
+                    >
+                      {/* Modal Header */}
+                      <div className="p-4 md:p-5 border-b border-zinc-100 flex items-center justify-between bg-zinc-50/60">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-600 flex items-center justify-center text-white shadow-sm">
+                            <Radio size={16} className="animate-pulse" />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <h3 className="font-bold text-sm text-zinc-900">Aura Live Voice Session</h3>
+                              <span className="text-[10px] bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded font-mono font-semibold">
+                                gemini-3.8-live
+                              </span>
+                            </div>
+                            <p className="text-xs text-zinc-500">Real-time bidirectional voice conversation</p>
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => endLiveVoiceSession(false)}
+                          className="p-2 text-zinc-400 hover:text-zinc-600 rounded-xl hover:bg-zinc-100 transition-colors"
+                        >
+                          <X size={18} />
+                        </button>
+                      </div>
+
+                      {/* Visualizer & Status Area */}
+                      <div className="p-8 flex flex-col items-center justify-center text-center bg-gradient-to-b from-indigo-50/40 to-transparent">
+                        <div className="relative w-36 h-36 flex items-center justify-center mb-5">
+                          {/* Pulsing Concentric Aura Waves */}
+                          <div
+                            className={cn(
+                              "absolute inset-0 rounded-full transition-all duration-700",
+                              liveStatus === 'speaking'
+                                ? "bg-violet-400/25 animate-ping"
+                                : liveStatus === 'listening'
+                                ? "bg-indigo-300/20 animate-pulse"
+                                : "bg-zinc-200/40"
+                            )}
+                          />
+                          <div
+                            className={cn(
+                              "absolute inset-3 rounded-full transition-all duration-500",
+                              liveStatus === 'speaking'
+                                ? "bg-violet-500/20 animate-pulse"
+                                : liveStatus === 'listening'
+                                ? "bg-indigo-400/15"
+                                : "bg-zinc-100"
+                            )}
+                          />
+                          {/* Center Orb */}
+                          <div
+                            className={cn(
+                              "w-20 h-20 rounded-full flex items-center justify-center shadow-lg transition-all duration-300",
+                              liveStatus === 'speaking'
+                                ? "bg-gradient-to-tr from-violet-600 to-indigo-600 text-white scale-110 shadow-violet-300"
+                                : liveStatus === 'listening'
+                                ? "bg-gradient-to-tr from-indigo-600 to-cyan-500 text-white shadow-indigo-200"
+                                : liveStatus === 'connecting'
+                                ? "bg-amber-500 text-white animate-spin shadow-amber-200"
+                                : "bg-zinc-300 text-zinc-600"
+                            )}
+                          >
+                            {liveStatus === 'speaking' ? (
+                              <Volume2 size={32} className="animate-bounce [animation-duration:1s]" />
+                            ) : liveStatus === 'listening' ? (
+                              <Mic size={32} className={isLiveMuted ? "opacity-40" : ""} />
+                            ) : liveStatus === 'connecting' ? (
+                              <RefreshCw size={28} />
+                            ) : (
+                              <MicOff size={28} />
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Status Label */}
+                        <div className="space-y-1">
+                          <p className="text-sm font-bold text-zinc-800">
+                            {liveStatus === 'connecting' && "Connecting to Gemini 3.8 Live API..."}
+                            {liveStatus === 'connected' && "Connected! Speak to Aura naturally."}
+                            {liveStatus === 'listening' && (isLiveMuted ? "Microphone muted" : "Listening to your voice...")}
+                            {liveStatus === 'speaking' && "Aura is responding..."}
+                            {liveStatus === 'disconnected' && "Voice call disconnected."}
+                          </p>
+                          <p className="text-xs text-zinc-500">
+                            {liveStatus === 'speaking'
+                              ? "Live 24kHz audio streaming • Tap 'Interrupt' to cut in"
+                              : "Speak freely; Aura processes low-latency audio in real-time."}
+                          </p>
+                          {liveError && (
+                            <p className="text-xs text-red-600 bg-red-50 px-3 py-1 rounded-lg border border-red-200 mt-2 font-medium">
+                              {liveError}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Live Transcript Stream */}
+                      <div className="flex-1 overflow-y-auto px-5 py-3 border-y border-zinc-100 bg-zinc-50/30 max-h-48 min-h-[120px] space-y-2.5 text-xs">
+                        {liveTranscriptLog.length === 0 ? (
+                          <div className="h-full flex items-center justify-center text-zinc-400 italic text-center py-6">
+                            Transcripts from gemini-3.8-live will stream here in real time...
+                          </div>
+                        ) : (
+                          liveTranscriptLog.map((log, idx) => (
+                            <div
+                              key={idx}
+                              className={cn(
+                                "p-2.5 rounded-xl leading-relaxed flex flex-col gap-0.5",
+                                log.speaker === 'user'
+                                  ? "bg-indigo-50 border border-indigo-100 text-indigo-950 ml-6"
+                                  : "bg-white border border-zinc-200 text-zinc-800 mr-6"
+                              )}
+                            >
+                              <div className="flex items-center justify-between text-[10px] font-semibold opacity-70">
+                                <span>{log.speaker === 'user' ? 'You' : 'Aura (3.8 Live)'}</span>
+                                <span>{log.time}</span>
+                              </div>
+                              <p className="text-xs font-normal">{log.text}</p>
+                            </div>
+                          ))
+                        )}
+                        <div ref={liveTranscriptEndRef} />
+                      </div>
+
+                      {/* Modal Controls */}
+                      <div className="p-4 bg-white flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          {/* Mute Button */}
+                          <button
+                            type="button"
+                            onClick={toggleLiveMute}
+                            className={cn(
+                              "flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border transition-all",
+                              isLiveMuted
+                                ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100"
+                                : "bg-zinc-50 text-zinc-700 border-zinc-200 hover:bg-zinc-100"
+                            )}
+                          >
+                            {isLiveMuted ? <MicOff size={15} /> : <Mic size={15} />}
+                            <span>{isLiveMuted ? "Unmute" : "Mute"}</span>
+                          </button>
+
+                          {/* Interrupt Button */}
+                          {liveStatus === 'speaking' && (
+                            <button
+                              type="button"
+                              onClick={interruptLivePlayback}
+                              className="flex items-center gap-1.5 px-3 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-xl text-xs font-semibold transition-colors"
+                              title="Interrupt Aura's speech"
+                            >
+                              <VolumeX size={15} />
+                              <span>Interrupt</span>
+                            </button>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => endLiveVoiceSession(false)}
+                            className="px-3 py-2 text-xs text-zinc-500 hover:text-zinc-800 font-medium transition-colors"
+                          >
+                            End Call
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => endLiveVoiceSession(true)}
+                            className="flex items-center gap-1.5 px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 text-white rounded-xl text-xs font-bold shadow-md shadow-indigo-100 transition-all active:scale-95"
+                          >
+                            <PhoneOff size={14} />
+                            <span>Save & Close</span>
+                          </button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </motion.div>
           )}
 
@@ -1133,27 +1737,116 @@ export default function App() {
                     <h2 className="text-3xl font-display font-bold">Micro-Lessons</h2>
                     <p className="text-zinc-500">Fast, actionable learning in 5–10 minutes. Click Read on any lesson.</p>
                   </div>
-                  <button 
-                    onClick={() => setIsLessonCreateModalOpen(true)}
-                    className="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors flex items-center gap-2"
-                  >
-                    <Plus size={16} /> Create Lesson
-                  </button>
+                  <div className="flex flex-col sm:flex-row gap-2.5 w-full md:w-auto">
+                    <div className="relative flex-1 md:w-64">
+                      <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+                      <input 
+                        type="text" 
+                        placeholder="Search micro-lessons..."
+                        value={lessonSearchQuery}
+                        onChange={(e) => setLessonSearchQuery(e.target.value)}
+                        className="w-full bg-white border border-zinc-200 rounded-xl py-2 pl-10 pr-8 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all placeholder:text-zinc-400"
+                      />
+                      {lessonSearchQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setLessonSearchQuery('')}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                        >
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
+                    <button 
+                      onClick={() => setIsLessonCreateModalOpen(true)}
+                      className="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-sm shadow-indigo-100 whitespace-nowrap"
+                    >
+                      <Plus size={16} /> Create Lesson
+                    </button>
+                  </div>
                 </header>
+
+                {/* Category Filter Pills */}
+                <div className="flex flex-wrap items-center gap-2 pt-1 pb-2">
+                  <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider mr-1">Category:</span>
+                  {['All', 'Productivity', 'Design', 'Culinary', 'Tech', 'Health', 'Communication'].map(category => (
+                    <button
+                      key={category}
+                      type="button"
+                      onClick={() => setSelectedLessonCategory(category)}
+                      className={cn(
+                        "px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer",
+                        selectedLessonCategory === category
+                          ? "bg-indigo-600 text-white shadow-sm"
+                          : "bg-white border border-zinc-200 text-zinc-600 hover:border-zinc-300 hover:bg-zinc-50"
+                      )}
+                    >
+                      {category}
+                    </button>
+                  ))}
+                  {(lessonSearchQuery || selectedLessonCategory !== 'All') && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLessonSearchQuery('');
+                        setSelectedLessonCategory('All');
+                      }}
+                      className="text-xs font-bold text-indigo-600 hover:text-indigo-800 ml-auto transition-colors cursor-pointer"
+                    >
+                      Reset Filters
+                    </button>
+                  )}
+                </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                   {(() => {
                     const displayLessons = lessons.length > 0 ? lessons : DEMO_LESSONS;
-                    return displayLessons.map(lesson => (
-                      <LessonCard 
-                        key={lesson.id} 
-                        lesson={lesson} 
-                        currentUser={user} 
-                        isCompleted={completedLessonIds.includes(lesson.id || '')}
-                        onComplete={() => user && loadData(user.id)} 
-                        onSelect={(l) => setSelectedLesson(l as Lesson)}
-                      />
-                    ));
+                    const filteredLessons = displayLessons.filter(lesson => {
+                      const matchCategory = selectedLessonCategory === 'All' || 
+                        (lesson.skill_tag && lesson.skill_tag.toLowerCase().includes(selectedLessonCategory.toLowerCase()));
+                      const matchQuery = !lessonSearchQuery ||
+                        lesson.title?.toLowerCase().includes(lessonSearchQuery.toLowerCase()) ||
+                        lesson.skill_tag?.toLowerCase().includes(lessonSearchQuery.toLowerCase()) ||
+                        lesson.content?.toLowerCase().includes(lessonSearchQuery.toLowerCase());
+                      return matchCategory && matchQuery;
+                    });
+
+                    return filteredLessons.length > 0 ? (
+                      filteredLessons.map(lesson => (
+                        <LessonCard 
+                          key={lesson.id} 
+                          lesson={lesson} 
+                          currentUser={user} 
+                          isCompleted={completedLessonIds.includes(lesson.id || '')}
+                          onComplete={() => user && loadData(user.id)} 
+                          onSelect={(l) => setSelectedLesson(l as Lesson)}
+                        />
+                      ))
+                    ) : (
+                      <div className="col-span-full p-12 glass rounded-3xl text-center space-y-4">
+                        <div className="w-16 h-16 bg-zinc-50 rounded-full flex items-center justify-center mx-auto text-zinc-300">
+                          <BookOpen size={32} />
+                        </div>
+                        <div className="space-y-1">
+                          <h4 className="font-bold text-zinc-800">No lessons match your search</h4>
+                          <p className="text-zinc-500 text-xs">
+                            {lessonSearchQuery 
+                              ? `No results for "${lessonSearchQuery}" in ${selectedLessonCategory} category.`
+                              : `No lessons found in ${selectedLessonCategory} category yet.`}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLessonSearchQuery('');
+                            setSelectedLessonCategory('All');
+                          }}
+                          className="px-5 py-2.5 bg-indigo-50 text-indigo-600 hover:bg-indigo-100 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+                        >
+                          Clear All Filters
+                        </button>
+                      </div>
+                    );
                   })()}
                 </div>
               </motion.div>
@@ -1185,7 +1878,18 @@ export default function App() {
                   </thead>
                   <tbody className="divide-y divide-zinc-100">
                     {leaderboard.map((u, i) => (
-                      <tr key={u.id} className={cn("hover:bg-zinc-50/50 transition-colors", u.id === user?.id && "bg-indigo-50/30")}>
+                      <tr 
+                        key={u.id} 
+                        onClick={() => {
+                          setSelectedSkillUser(u);
+                          setActiveTab('exchange');
+                        }}
+                        className={cn(
+                          "hover:bg-indigo-50/50 transition-colors cursor-pointer group", 
+                          u.id === user?.id && "bg-indigo-50/30"
+                        )}
+                        title="Click to view peer profile and request skill exchange"
+                      >
                         <td className="px-6 py-4">
                           <div className={cn(
                             "w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold",
@@ -1204,7 +1908,7 @@ export default function App() {
                               className="w-8 h-8 rounded-full" 
                               iconSize={14}
                             />
-                            <span className="font-medium">{u.name}</span>
+                            <span className="font-medium group-hover:text-indigo-600 transition-colors">{u.name}</span>
                             {u.achievements && u.achievements.length > 0 && (
                               <div className="flex gap-0.5">
                                 {u.achievements.slice(0, 3).map(a => (
@@ -1220,10 +1924,13 @@ export default function App() {
                           </div>
                         </td>
                         <td className="px-6 py-4">
-                          <span className="text-xs text-zinc-500 truncate max-w-[200px] block">{u.skills_offered}</span>
+                          <span className="text-xs text-zinc-500 truncate max-w-[200px] block">{u.skills_offered || 'General Mentorship'}</span>
                         </td>
                         <td className="px-6 py-4 text-right font-bold text-indigo-600">
-                          {u.points.toLocaleString()}
+                          <span className="flex items-center justify-end gap-1">
+                            {u.points.toLocaleString()}
+                            <ChevronRight size={14} className="opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition-all text-indigo-500" />
+                          </span>
                         </td>
                       </tr>
                     ))}
@@ -1823,15 +2530,22 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
                 <div className="md:col-span-1 space-y-4">
                   <nav className="space-y-1">
-                    {['Account', 'Notifications', 'Privacy', 'Billing'].map((item) => (
+                    {['All', 'Account', 'Notifications', 'Privacy', 'Billing'].map((item) => (
                       <button
                         key={item}
+                        type="button"
+                        onClick={() => setSettingsSubTab(item.toLowerCase() as any)}
                         className={cn(
-                          "w-full text-left px-4 py-3 rounded-xl text-sm font-medium transition-all",
-                          item === 'Account' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50 hover:text-zinc-900"
+                          "w-full text-left px-4 py-3 rounded-xl text-sm font-medium transition-all cursor-pointer flex items-center justify-between",
+                          (item === 'All' && settingsSubTab === 'all') || settingsSubTab === item.toLowerCase()
+                            ? "bg-indigo-50 text-indigo-600 font-bold shadow-xs" 
+                            : "text-zinc-500 hover:bg-zinc-50 hover:text-zinc-900"
                         )}
                       >
-                        {item}
+                        <span>{item === 'All' ? 'All Settings' : item}</span>
+                        {((item === 'All' && settingsSubTab === 'all') || settingsSubTab === item.toLowerCase()) && (
+                          <div className="w-1.5 h-1.5 rounded-full bg-indigo-600" />
+                        )}
                       </button>
                     ))}
                   </nav>
@@ -1839,144 +2553,217 @@ export default function App() {
 
                 <div className="md:col-span-2 space-y-8">
                   {/* Account Section */}
-                  <section className="glass rounded-3xl p-8 space-y-6">
-                    <h3 className="text-lg font-bold flex items-center gap-2">
-                      <UserIcon size={20} className="text-zinc-400" /> Account Information
-                    </h3>
-                    <div className="space-y-4">
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div className="space-y-1">
-                          <label className="text-xs font-bold text-zinc-400 uppercase">Email Address</label>
-                          <input 
-                            type="email" 
-                            defaultValue={user?.email}
-                            className="w-full bg-zinc-50 border border-zinc-200 rounded-xl py-3 px-4 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
-                          />
+                  {(settingsSubTab === 'all' || settingsSubTab === 'account') && (
+                    <section className="glass rounded-3xl p-8 space-y-6">
+                      <h3 className="text-lg font-bold flex items-center gap-2">
+                        <UserIcon size={20} className="text-zinc-400" /> Account Information
+                      </h3>
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          <div className="space-y-1">
+                            <label className="text-xs font-bold text-zinc-400 uppercase">Email Address</label>
+                            <input 
+                              type="email" 
+                              readOnly
+                              value={user?.email || ''}
+                              className="w-full bg-zinc-100/70 text-zinc-600 border border-zinc-200 rounded-xl py-3 px-4 text-sm cursor-not-allowed"
+                            />
+                            <p className="text-[10px] text-zinc-400">Primary authentication identifier</p>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-xs font-bold text-zinc-400 uppercase">Preferred Language</label>
+                            <select 
+                              value={preferredLanguage}
+                              onChange={(e) => setPreferredLanguage(e.target.value)}
+                              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl py-3 px-4 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all cursor-pointer"
+                            >
+                              <option value="English (US)">English (US)</option>
+                              <option value="Spanish">Spanish (Español)</option>
+                              <option value="French">French (Français)</option>
+                              <option value="German">German (Deutsch)</option>
+                              <option value="Japanese">Japanese (日本語)</option>
+                              <option value="Mandarin">Mandarin (中文)</option>
+                            </select>
+                            <p className="text-[10px] text-zinc-400">Controls coach and micro-curriculum language</p>
+                          </div>
                         </div>
-                        <div className="space-y-1">
-                          <label className="text-xs font-bold text-zinc-400 uppercase">Language</label>
-                          <select className="w-full bg-zinc-50 border border-zinc-200 rounded-xl py-3 px-4 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all">
-                            <option>English (US)</option>
-                            <option>Spanish</option>
-                            <option>French</option>
-                            <option>German</option>
-                          </select>
-                        </div>
-                      </div>
 
-                      <div className="pt-4 border-t border-zinc-100">
-                        <PasswordSettings />
+                        <div className="flex items-center justify-between pt-2">
+                          {accountSaveStatus ? (
+                            <span className="text-xs font-semibold text-emerald-600 flex items-center gap-1.5">
+                              <CheckCircle2 size={14} /> {accountSaveStatus}
+                            </span>
+                          ) : <div />}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              try {
+                                localStorage.setItem('aura_preferred_lang', preferredLanguage);
+                                setAccountSaveStatus('Language preferences saved!');
+                                setTimeout(() => setAccountSaveStatus(null), 3500);
+                              } catch (_) {}
+                            }}
+                            className="px-4 py-2 bg-indigo-600 text-white rounded-xl text-xs font-bold hover:bg-indigo-700 transition-colors shadow-xs cursor-pointer"
+                          >
+                            Save Preferences
+                          </button>
+                        </div>
+
+                        <div className="pt-4 border-t border-zinc-100">
+                          <PasswordSettings />
+                        </div>
                       </div>
-                    </div>
-                  </section>
+                    </section>
+                  )}
 
                   {/* Notifications Section */}
-                  <section className="glass rounded-3xl p-8 space-y-6">
-                    <h3 className="text-lg font-bold flex items-center gap-2">
-                      <Bell size={20} className="text-zinc-400" /> Notification Preferences
-                    </h3>
-                    <div className="space-y-6">
-                      <div className="space-y-3">
-                        <p className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Activity Alerts</p>
-                        <SettingsToggle 
-                          label="Skill Exchange Requests" 
-                          description="Get notified when someone wants to learn from you."
-                          icon={<Users size={18} />}
-                          checked={notificationSettings.exchangeRequests}
-                          onChange={(checked) => setNotificationSettings(prev => ({ ...prev, exchangeRequests: checked }))}
-                        />
-                        <SettingsToggle 
-                          label="Lesson Completions" 
-                          description="Receive alerts when students complete your micro-lessons."
-                          icon={<CheckCircle size={18} />}
-                          checked={notificationSettings.lessonCompletions}
-                          onChange={(checked) => setNotificationSettings(prev => ({ ...prev, lessonCompletions: checked }))}
-                        />
-                        <SettingsToggle 
-                          label="Feedback Received" 
-                          description="Get notified when you receive new ratings or comments."
-                          icon={<Star size={18} />}
-                          checked={notificationSettings.feedbackReceived}
-                          onChange={(checked) => setNotificationSettings(prev => ({ ...prev, feedbackReceived: checked }))}
-                        />
-                      </div>
+                  {(settingsSubTab === 'all' || settingsSubTab === 'notifications') && (
+                    <section className="glass rounded-3xl p-8 space-y-6">
+                      <h3 className="text-lg font-bold flex items-center gap-2">
+                        <Bell size={20} className="text-zinc-400" /> Notification Preferences
+                      </h3>
+                      <div className="space-y-6">
+                        <div className="space-y-3">
+                          <p className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Activity Alerts</p>
+                          <SettingsToggle 
+                            label="Skill Exchange Requests" 
+                            description="Get notified when someone wants to learn from you."
+                            icon={<Users size={18} />}
+                            checked={notificationSettings.exchangeRequests}
+                            onChange={(checked) => setNotificationSettings(prev => ({ ...prev, exchangeRequests: checked }))}
+                          />
+                          <SettingsToggle 
+                            label="Lesson Completions" 
+                            description="Receive alerts when students complete your micro-lessons."
+                            icon={<CheckCircle size={18} />}
+                            checked={notificationSettings.lessonCompletions}
+                            onChange={(checked) => setNotificationSettings(prev => ({ ...prev, lessonCompletions: checked }))}
+                          />
+                          <SettingsToggle 
+                            label="Feedback Received" 
+                            description="Get notified when you receive new ratings or comments."
+                            icon={<Star size={18} />}
+                            checked={notificationSettings.feedbackReceived}
+                            onChange={(checked) => setNotificationSettings(prev => ({ ...prev, feedbackReceived: checked }))}
+                          />
+                        </div>
 
-                      <div className="pt-4 border-t border-zinc-100 space-y-3">
-                        <p className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Channels</p>
-                        <SettingsToggle 
-                          label="Weekly Summaries" 
-                          description="Receive a digest of your progress and community highlights."
-                          icon={<Mail size={18} />}
-                          checked={notificationSettings.weeklySummaries}
-                          onChange={(checked) => setNotificationSettings(prev => ({ ...prev, weeklySummaries: checked }))}
-                        />
-                        <SettingsToggle 
-                          label="Push Notifications" 
-                          description="Get instant alerts for new messages and match requests."
-                          icon={<Zap size={18} />}
-                          checked={notificationSettings.pushAlerts}
-                          onChange={(checked) => setNotificationSettings(prev => ({ ...prev, pushAlerts: checked }))}
-                        />
-                        <SettingsToggle 
-                          label="Marketing Emails" 
-                          description="Stay updated with new features and community news."
-                          icon={<Sparkles size={18} />}
-                          checked={notificationSettings.marketing}
-                          onChange={(checked) => setNotificationSettings(prev => ({ ...prev, marketing: checked }))}
-                        />
+                        <div className="pt-4 border-t border-zinc-100 space-y-3">
+                          <p className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Channels</p>
+                          <SettingsToggle 
+                            label="Weekly Summaries" 
+                            description="Receive a digest of your progress and community highlights."
+                            icon={<Mail size={18} />}
+                            checked={notificationSettings.weeklySummaries}
+                            onChange={(checked) => setNotificationSettings(prev => ({ ...prev, weeklySummaries: checked }))}
+                          />
+                          <SettingsToggle 
+                            label="Push Notifications" 
+                            description="Get instant alerts for new messages and match requests."
+                            icon={<Zap size={18} />}
+                            checked={notificationSettings.pushAlerts}
+                            onChange={(checked) => setNotificationSettings(prev => ({ ...prev, pushAlerts: checked }))}
+                          />
+                          <SettingsToggle 
+                            label="Marketing Emails" 
+                            description="Stay updated with new features and community news."
+                            icon={<Sparkles size={18} />}
+                            checked={notificationSettings.marketing}
+                            onChange={(checked) => setNotificationSettings(prev => ({ ...prev, marketing: checked }))}
+                          />
+                        </div>
                       </div>
-                    </div>
-                  </section>
+                    </section>
+                  )}
 
                   {/* Privacy Section */}
-                  <section className="glass rounded-3xl p-8 space-y-6">
-                    <h3 className="text-lg font-bold flex items-center gap-2">
-                      <Shield size={20} className="text-zinc-400" /> Privacy & Security
-                    </h3>
-                    <div className="space-y-3">
-                      <SettingsToggle 
-                        label="Public Profile" 
-                        description="Allow other users to find you in the Global Exchange."
-                        icon={<Globe size={18} />}
-                        checked={true}
-                        onChange={() => {}}
-                      />
-                      <SettingsToggle 
-                        label="Show Points" 
-                        description="Display your total Aura points on the leaderboard."
-                        icon={<Trophy size={18} />}
-                        checked={true}
-                        onChange={() => {}}
-                      />
-                      <SettingsToggle 
-                        label="Two-Factor Authentication" 
-                        description="Add an extra layer of security to your account."
-                        icon={<Lock size={18} />}
-                        checked={false}
-                        onChange={() => {}}
-                      />
-                    </div>
-                  </section>
+                  {(settingsSubTab === 'all' || settingsSubTab === 'privacy') && (
+                    <section className="glass rounded-3xl p-8 space-y-6">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-lg font-bold flex items-center gap-2">
+                          <Shield size={20} className="text-zinc-400" /> Privacy & Security
+                        </h3>
+                        {privacySaveMsg && (
+                          <span className="text-xs font-semibold text-emerald-600 flex items-center gap-1">
+                            <CheckCircle2 size={13} /> {privacySaveMsg}
+                          </span>
+                        )}
+                      </div>
+                      <div className="space-y-3">
+                        <SettingsToggle 
+                          label="Public Profile" 
+                          description="Allow other users to find you in the Global Exchange."
+                          icon={<Globe size={18} />}
+                          checked={privacySettings.publicProfile}
+                          onChange={(val) => {
+                            const next = { ...privacySettings, publicProfile: val };
+                            setPrivacySettings(next);
+                            try {
+                              localStorage.setItem('aura_privacy_settings', JSON.stringify(next));
+                            } catch (_) {}
+                            setPrivacySaveMsg('Profile visibility updated.');
+                            setTimeout(() => setPrivacySaveMsg(null), 3000);
+                          }}
+                        />
+                        <SettingsToggle 
+                          label="Show Points" 
+                          description="Display your total Aura points on the leaderboard."
+                          icon={<Trophy size={18} />}
+                          checked={privacySettings.showPoints}
+                          onChange={(val) => {
+                            const next = { ...privacySettings, showPoints: val };
+                            setPrivacySettings(next);
+                            try {
+                              localStorage.setItem('aura_privacy_settings', JSON.stringify(next));
+                            } catch (_) {}
+                            setPrivacySaveMsg('Leaderboard score privacy updated.');
+                            setTimeout(() => setPrivacySaveMsg(null), 3000);
+                          }}
+                        />
+                        <SettingsToggle 
+                          label="Two-Factor Authentication" 
+                          description="Add an extra layer of security to your account."
+                          icon={<Lock size={18} />}
+                          checked={privacySettings.twoFactor}
+                          onChange={(val) => {
+                            const next = { ...privacySettings, twoFactor: val };
+                            setPrivacySettings(next);
+                            try {
+                              localStorage.setItem('aura_privacy_settings', JSON.stringify(next));
+                            } catch (_) {}
+                            setPrivacySaveMsg(val ? '2FA protection enabled.' : '2FA protection disabled.');
+                            setTimeout(() => setPrivacySaveMsg(null), 3000);
+                          }}
+                        />
+                      </div>
+                    </section>
+                  )}
 
                   {/* Billing Section */}
-                  <section className="glass rounded-3xl p-8 space-y-6">
-                    <h3 className="text-lg font-bold flex items-center gap-2">
-                      <CreditCard size={20} className="text-zinc-400" /> Subscription & Billing
-                    </h3>
-                    <div className="p-6 bg-indigo-600 rounded-2xl text-white space-y-4 shadow-lg shadow-indigo-200">
-                      <div className="flex justify-between items-start">
-                        <div>
-                          <p className="text-indigo-100 text-xs font-bold uppercase tracking-wider">Current Plan</p>
-                          <h4 className="text-2xl font-display font-bold">Aura Pro</h4>
+                  {(settingsSubTab === 'all' || settingsSubTab === 'billing') && (
+                    <section className="glass rounded-3xl p-8 space-y-6">
+                      <h3 className="text-lg font-bold flex items-center gap-2">
+                        <CreditCard size={20} className="text-zinc-400" /> Subscription & Billing
+                      </h3>
+                      <div className="p-6 bg-gradient-to-r from-indigo-600 to-indigo-700 rounded-2xl text-white space-y-4 shadow-lg shadow-indigo-200">
+                        <div className="flex justify-between items-start">
+                          <div>
+                            <p className="text-indigo-100 text-xs font-bold uppercase tracking-wider">Current Plan</p>
+                            <h4 className="text-2xl font-display font-bold">Aura Pro</h4>
+                          </div>
+                          <span className="bg-white/20 backdrop-blur-md px-3 py-1 rounded-full text-[10px] font-bold uppercase">Active</span>
                         </div>
-                        <span className="bg-white/20 backdrop-blur-md px-3 py-1 rounded-full text-[10px] font-bold uppercase">Active</span>
+                        <p className="text-sm text-indigo-50">Your next billing date is April 6, 2026 ($12.00/mo).</p>
+                        <button 
+                          type="button"
+                          onClick={() => setShowBillingModal(true)}
+                          className="w-full py-3 bg-white text-indigo-600 rounded-xl text-sm font-bold hover:bg-indigo-50 transition-all cursor-pointer shadow-sm active:scale-[0.99]"
+                        >
+                          Manage Subscription
+                        </button>
                       </div>
-                      <p className="text-sm text-indigo-50">Your next billing date is April 6, 2026.</p>
-                      <button className="w-full py-3 bg-white text-indigo-600 rounded-xl text-sm font-bold hover:bg-indigo-50 transition-all">
-                        Manage Subscription
-                      </button>
-                    </div>
-                  </section>
+                    </section>
+                  )}
 
                   {/* Sign Out Section */}
                   <section className="glass rounded-3xl p-8 flex flex-col sm:flex-row justify-between items-center gap-4">
@@ -1986,7 +2773,7 @@ export default function App() {
                     </div>
                     <button 
                       onClick={handleLogout}
-                      className="w-full sm:w-auto flex items-center justify-center gap-2 px-8 py-3 bg-white border border-zinc-200 text-zinc-700 rounded-2xl font-bold hover:bg-zinc-50 hover:border-zinc-300 transition-all shadow-sm active:scale-95"
+                      className="w-full sm:w-auto flex items-center justify-center gap-2 px-8 py-3 bg-white border border-zinc-200 text-zinc-700 rounded-2xl font-bold hover:bg-zinc-50 hover:border-zinc-300 transition-all shadow-sm active:scale-95 cursor-pointer"
                     >
                       <LogOut size={20} />
                       Log Out
@@ -2009,6 +2796,14 @@ export default function App() {
             />
           )}
         </AnimatePresence>
+
+        {/* Subscription & Billing Management Modal */}
+        <SubscriptionModal 
+          isOpen={showBillingModal}
+          onClose={() => setShowBillingModal(false)}
+          userEmail={user?.email}
+          userName={user?.name}
+        />
       </main>
 
       {/* Footer / Mobile Nav */}
